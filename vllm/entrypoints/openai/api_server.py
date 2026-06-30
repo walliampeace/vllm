@@ -246,6 +246,12 @@ def build_app(
 
         register_pooling_api_routers(app, supported_tasks, model_config)
 
+    from vllm.entrypoints.router.api_router import (
+        attach_router as attach_router_classify,
+    )
+
+    attach_router_classify(app)
+
     app.root_path = args.root_path
     app.add_middleware(
         CORSMiddleware,
@@ -414,9 +420,20 @@ async def init_app_state(
 
         init_pooling_state(engine_client, state, args, request_logger, supported_tasks)
 
+    from vllm.entrypoints.router.serving import ServingRouterClassification
+
+    state.serving_router_classification = ServingRouterClassification(
+        engine_client=engine_client,
+        models=state.openai_serving_models,
+        request_logger=request_logger,
+        chat_template=resolved_chat_template,
+        chat_template_content_format=args.chat_template_content_format,
+        default_chat_template_kwargs=args.default_chat_template_kwargs,
+        trust_request_chat_template=args.trust_request_chat_template,
+    )
+
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
-
 
 async def init_render_app_state(
     vllm_config: VllmConfig,

@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # Copyright 2025 The vLLM team.
@@ -28,6 +27,7 @@ import typing
 from collections.abc import Callable, Iterable
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
@@ -40,6 +40,7 @@ from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.pooler import PoolingParamsUpdate
 from vllm.model_executor.layers.mamba.gdn_linear_attn import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
@@ -194,6 +195,72 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             )
 
 
+class ClassificationHead(nn.Module):
+    def __init__(self, in_features, num_classes, dropout_prob=0):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout_prob)
+        self.cls_head = nn.Linear(in_features, num_classes)
+
+class RouterClsPooler(nn.Module):
+    def __init__(self, model) -> None:
+        super().__init__()
+        object.__setattr__(self, "_model", model)
+    @property
+    def model(self):
+        return object.__getattribute__(self, "_model")
+    def get_supported_tasks(self) -> set[str]:
+        return {"embed", "classify", "score"}
+    def get_pooling_updates(self, task):
+        return PoolingParamsUpdate(requires_token_ids=task in {"embed", "classify", "score"})
+    def forward(self, hidden_states: torch.Tensor, pooling_metadata) -> torch.Tensor | list[torch.Tensor | None]:
+        token_ids = getattr(pooling_metadata, "prompt_token_ids", None)
+        lm_head = getattr(self.model, "lm_head", None)
+        lm_head_name = type(lm_head).__name__ if lm_head is not None else "None"
+        n = max(int(getattr(self.model, "num_classes", 0)), 1)
+        num_reqs = int(len(getattr(pooling_metadata, "prompt_lens", []))) or 1
+        if token_ids is None or getattr(self.model, "cls_id", None) is None or getattr(self.model, "classifier", None) is None or getattr(self.model, "num_classes", 0) <= 0 or not get_pp_group().is_last_rank or lm_head is None or "StageMissingLayer" in lm_head_name or "PPMissingLayer" in lm_head_name:
+            return torch.zeros((num_reqs, n), device=hidden_states.device, dtype=hidden_states.dtype)
+
+        pooling_cursor = pooling_metadata.get_pooling_cursor()
+        hidden_states_lst = [
+            hidden_states[first : last + 1]
+            for first, last in zip(
+                pooling_cursor.first_token_indices_gpu.tolist(),
+                pooling_cursor.last_token_indices_gpu.tolist(),
+            )
+        ]
+        token_ids_lst = pooling_metadata.get_prompt_token_ids()
+        is_partial_prefill = bool(pooling_cursor.is_partial_prefill())
+        finished_list = pooling_cursor.is_finished().tolist()
+
+        if not is_partial_prefill:
+            outputs = [
+                self.model.compute_cls_logits(hidden_states=hs, input_ids=ids)
+                for hs, ids in zip(hidden_states_lst, token_ids_lst)
+            ]
+            return torch.cat([
+                out if out.ndim == 2 else out.unsqueeze(0)
+                for out in outputs
+            ], dim=0)
+
+        output_list: list[torch.Tensor | None] = []
+        for p, hs_chunk in zip(pooling_metadata.pooling_states, hidden_states_lst):
+            p.hidden_states_cache.append(hs_chunk)
+        for req_idx, (p, ids, finished) in enumerate(zip(
+            pooling_metadata.pooling_states,
+            token_ids_lst,
+            finished_list,
+        )):
+            if not finished:
+                output_list.append(None)
+                continue
+            hidden_states_cache = p.hidden_states_cache
+            full_hidden_states = hidden_states_cache[0] if len(hidden_states_cache) == 1 else torch.cat(hidden_states_cache, dim=0)
+            cls_logits = self.model.compute_cls_logits(hidden_states=full_hidden_states, input_ids=ids)
+            p.clean()
+            output_list.append(cls_logits if cls_logits.ndim == 2 else cls_logits.unsqueeze(0))
+        return output_list
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -245,6 +312,10 @@ class Qwen3_5Model(Qwen3NextModel):
         else:
             self.norm = PPMissingLayer()
 
+        # Keep auxiliary hidden states disabled for normal inference.
+        # vLLM pooling/classification paths expect the model forward output to
+        # be a single Tensor. Eagle3 can still enable aux layers explicitly via
+        # set_aux_hidden_state_layers().
         self.aux_hidden_state_layers: tuple[int, ...] = ()
 
     def load_fused_expert_weights(
@@ -502,8 +573,23 @@ class Qwen3_5ForCausalLMBase(
                 )
         else:
             self.lm_head = PPMissingLayer()
+        self._cls_lm_head_weight_cpu: torch.Tensor | None = None
+        self._cls_lm_head_bias_cpu: torch.Tensor | None = None
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        hf_config = vllm_config.model_config.hf_config
+        candidate_models = getattr(hf_config, "candidate_models", None)
+        self.num_classes = len(candidate_models) if candidate_models is not None else 0
+        self.cls_id = getattr(hf_config, "cls_id", None)
+        if self.cls_id is None:
+            raise ValueError("hf_config.cls_id is required for classification")
+        self.cls_id = int(self.cls_id)
+        self.model.cls_id = self.cls_id
+        self.classifier = (
+            ClassificationHead(config.vocab_size, self.num_classes, getattr(hf_config, "cls_dropout_prob", 0.0))
+            if self.num_classes > 0 and get_pp_group().is_last_rank else None
+        )
+        self.pooler = RouterClsPooler(self) if self.num_classes > 0 and get_pp_group().is_last_rank else None
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -538,12 +624,54 @@ class Qwen3_5ForCausalLMBase(
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def compute_cls_logits(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        if not get_pp_group().is_last_rank:
+            raise RuntimeError("compute_cls_logits must be called on the last pipeline rank")
+        if self.classifier is None or self.num_classes <= 0:
+            raise ValueError("candidate_models is required to enable classification head")
+        lm_head = getattr(self, "lm_head", None)
+        lm_head_name = type(lm_head).__name__ if lm_head is not None else "None"
+        if lm_head is None or "StageMissingLayer" in lm_head_name or "PPMissingLayer" in lm_head_name:
+            raise RuntimeError("compute_cls_logits requires a usable lm_head on the current rank")
+        if not isinstance(input_ids, torch.Tensor):
+            input_ids = torch.tensor(input_ids, device=hidden_states.device)
+        input_ids = input_ids.to(hidden_states.device).reshape(-1)
+        seq_len = hidden_states.shape[0]
+        if input_ids.numel() > seq_len:
+            input_ids = input_ids[-seq_len:]
+        elif input_ids.numel() < seq_len:
+            raise RuntimeError(f"input_ids shorter than hidden_states in compute_cls_logits: {input_ids.numel()} < {seq_len}")
+        cls_mask = input_ids == int(self.cls_id)
+        cls_indices = cls_mask.nonzero(as_tuple=False).flatten().tolist()
+        if not cls_indices:
+            cls_logits = torch.zeros((1, self.num_classes), device=hidden_states.device, dtype=hidden_states.dtype)
+            return cls_logits
+        cls_hidden_states = hidden_states[cls_indices[0]].unsqueeze(0)
+        lm_head_weight = self._cls_lm_head_weight_cpu
+        lm_head_bias = self._cls_lm_head_bias_cpu
+        if lm_head_weight is None:
+            raise RuntimeError("cached lm_head.weight is required to compute cls features")
+        lm_head_weight = lm_head_weight.to(hidden_states.device, dtype=hidden_states.dtype)
+        lm_head_bias = lm_head_bias.to(hidden_states.device, dtype=hidden_states.dtype) if lm_head_bias is not None else None
+        cls_features = F.linear(cls_hidden_states, lm_head_weight, lm_head_bias)
+        cls_logits = F.linear(cls_features, self.classifier.cls_head.weight, self.classifier.cls_head.bias)
+        return cls_logits
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        def _capture_lm_head_weights() -> Iterable[tuple[str, torch.Tensor]]:
+            for name, tensor in weights:
+                if name == "lm_head.weight":
+                    self._cls_lm_head_weight_cpu = tensor.detach().cpu().clone()
+                elif name == "lm_head.bias":
+                    self._cls_lm_head_bias_cpu = tensor.detach().cpu().clone()
+                yield name, tensor
+
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=["mtp."],
         )
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(_capture_lm_head_weights())
+        return loaded
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
@@ -687,6 +815,22 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
 
         if intermediate_tensors is not None:
             inputs_embeds = None
+
+        cls_id = getattr(self.language_model, "cls_id", None)
+        cls_indices = []
+        if cls_id is not None and input_ids is not None:
+            cls_indices = (input_ids == int(cls_id)).nonzero(as_tuple=False).flatten().tolist()
+        if positions is not None:
+            cls_start = max(0, cls_indices[0] - 4) if cls_indices else 0
+            cls_end = cls_indices[0] + 5 if cls_indices else 0
+            if positions.ndim == 1:
+                pos_head = positions[:8].detach().cpu().tolist()
+                pos_tail = positions[-8:].detach().cpu().tolist()
+                pos_cls_window = positions[cls_start:cls_end].detach().cpu().tolist() if cls_indices else []
+            else:
+                pos_head = positions[:, :8].detach().cpu().tolist()
+                pos_tail = positions[:, -8:].detach().cpu().tolist()
+                pos_cls_window = positions[:, cls_start:cls_end].detach().cpu().tolist() if cls_indices else []
 
         hidden_states = self.language_model.model(
             input_ids=input_ids,
