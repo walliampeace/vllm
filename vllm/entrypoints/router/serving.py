@@ -31,7 +31,6 @@ try:
 except Exception:
     AutoProcessor = None
 
-
 def _find_safe_truncate_pos(token_ids: list[int], max_prompt_tokens: int | None, content_token_ids: Any) -> int | None:
     ids = {int(x) for x in (content_token_ids or []) if x is not None and int(x) >= 0}
     if max_prompt_tokens is None or max_prompt_tokens < 0 or len(token_ids) <= max_prompt_tokens or not ids:
@@ -42,7 +41,6 @@ def _find_safe_truncate_pos(token_ids: list[int], max_prompt_tokens: int | None,
         if token_ids[pos - 1] not in ids and (pos >= len(token_ids) or token_ids[pos] not in ids):
             return pos
     return max_prompt_tokens
-
 
 def _truncate_prompt_ids(token_ids: list[int], *, max_prompt_tokens: int | None, cls_id: int | None, expects_cls: bool) -> list[int]:
     prompt_ids = [int(x) for x in token_ids]
@@ -55,17 +53,14 @@ def _truncate_prompt_ids(token_ids: list[int], *, max_prompt_tokens: int | None,
         prompt_ids[-1] = int(cls_id)
     return prompt_ids
 
-
 def _get_spatial_merge_size(processor: Any) -> int:
     image_processor = getattr(processor, "image_processor", None)
     return int(getattr(image_processor, "merge_size", None) or getattr(image_processor, "spatial_merge_size", None) or 2)
-
 
 def _count_content_tokens(prompt_ids: list[int], content_token_id: int | None) -> int:
     if content_token_id is None:
         return 0
     return sum(1 for tid in prompt_ids if tid == content_token_id)
-
 
 def _get_tokens_per_media(media_grid_thw: Any, processor: Any) -> list[int]:
     media_grid = _tolist_if_possible(media_grid_thw) or []
@@ -73,7 +68,6 @@ def _get_tokens_per_media(media_grid_thw: Any, processor: Any) -> list[int]:
         return []
     merge_size = _get_spatial_merge_size(processor)
     return [(int(t) * int(h) * int(w)) // (merge_size * merge_size) for t, h, w in media_grid]
-
 
 def _limit_truncate_pos_by_content_units(token_ids: list[int], truncate_pos: int | None, content_token_id: int | None, kept_units: int) -> int | None:
     if truncate_pos is None or truncate_pos < 0 or content_token_id is None or kept_units < 0:
@@ -86,7 +80,6 @@ def _limit_truncate_pos_by_content_units(token_ids: list[int], truncate_pos: int
                 return idx
     return truncate_pos
 
-
 def _trim_media_inputs_by_count(media_inputs: list[Any], media_grid_thw: Any, kept_count: int) -> tuple[list[Any], Any]:
     media_grid = _tolist_if_possible(media_grid_thw) or []
     if kept_count <= 0:
@@ -95,12 +88,15 @@ def _trim_media_inputs_by_count(media_inputs: list[Any], media_grid_thw: Any, ke
         raise ValueError(f"Media count exceeds available inputs: kept_count={kept_count}, media_inputs={len(media_inputs)}, media_grid={len(media_grid)}")
     return media_inputs[:kept_count], media_grid[:kept_count]
 
-
 def _validate_media_unit_alignment(media_inputs: list[Any], media_grid_thw: Any, kept_count: int, media_name: str) -> None:
     media_grid = _tolist_if_possible(media_grid_thw) or []
     if kept_count != len(media_inputs) or kept_count != len(media_grid):
         raise ValueError(f"{media_name} unit mismatch after trimming: kept={kept_count}, media_inputs={len(media_inputs)}, media_grid={len(media_grid)}")
 
+def _validate_prompt_len(prompt_ids: list[int], validation_limit: int | None, source_name: str) -> str | None:
+    if validation_limit is not None and validation_limit >= 0 and len(prompt_ids) > validation_limit:
+        return f"{source_name} too long after preprocessing: tokens={len(prompt_ids)}, limit={validation_limit}"
+    return None
 
 def _normalize_media_value(value: Any) -> Any:
     if isinstance(value, dict):
@@ -111,7 +107,6 @@ def _normalize_media_value(value: Any) -> Any:
         if isinstance(value.get("image"), str):
             return value["image"]
     return value
-
 
 def _normalize_media_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized = []
@@ -130,7 +125,6 @@ def _normalize_media_messages(messages: list[dict[str, Any]]) -> list[dict[str, 
             new_message["content"].append(new_item)
         normalized.append(new_message)
     return normalized
-
 
 def _restore_raw_media_fields(messages: list[dict[str, Any]], raw_messages: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     if not raw_messages:
@@ -153,7 +147,6 @@ def _restore_raw_media_fields(messages: list[dict[str, Any]], raw_messages: list
         restored.append(new_message)
     return restored
 
-
 def _tolist_if_possible(value: Any) -> Any:
     if value is None:
         return None
@@ -163,7 +156,6 @@ def _tolist_if_possible(value: Any) -> Any:
         except Exception:
             return None
     return value
-
 
 class ServingRouterClassification(OpenAIServing):
     def __init__(
@@ -231,9 +223,9 @@ class ServingRouterClassification(OpenAIServing):
                 video_content_token_id = int(video_content_token_id)
         except Exception:
             video_content_token_id = None
-        truncate_prompt_tokens = request.truncate_prompt_tokens
-        if truncate_prompt_tokens is None:
-            truncate_prompt_tokens = getattr(model_config, "max_model_len", None)
+        requested_truncation_limit = request.truncate_prompt_tokens
+        validation_limit = getattr(model_config, "max_model_len", None)
+        effective_truncation_limit = requested_truncation_limit if requested_truncation_limit is not None else validation_limit
 
         engine_prompts = []
         raw_json: dict[str, Any] = {}
@@ -289,9 +281,14 @@ class ServingRouterClassification(OpenAIServing):
                 image_token_costs = _get_tokens_per_media(image_grid_thw, processor)
                 image_placeholder_count = _count_content_tokens(raw_prompt_ids, image_content_token_id)
                 non_image_token_count = len(raw_prompt_ids) - image_placeholder_count
+                estimated_total_tokens = non_image_token_count + sum(int(x) for x in image_token_costs)
+                if validation_limit is not None and validation_limit >= 0 and estimated_total_tokens > validation_limit:
+                    return self.create_error_response(
+                        f"multimodal input too long before inference: estimated_tokens={estimated_total_tokens}, limit={validation_limit}"
+                    )
                 kept_images = len(image_token_costs)
-                if truncate_prompt_tokens is not None and truncate_prompt_tokens >= 0:
-                    available_image_budget = max(0, truncate_prompt_tokens - non_image_token_count)
+                if effective_truncation_limit is not None and effective_truncation_limit >= 0:
+                    available_image_budget = max(0, effective_truncation_limit - non_image_token_count)
                     kept_images = 0
                     used_image_budget = 0
                     for token_num in image_token_costs:
@@ -301,7 +298,7 @@ class ServingRouterClassification(OpenAIServing):
                         used_image_budget += int(token_num)
                 safe_truncate_tokens = _find_safe_truncate_pos(
                     raw_prompt_ids,
-                    truncate_prompt_tokens,
+                    effective_truncation_limit,
                     (image_content_token_id, video_content_token_id),
                 )
                 safe_truncate_tokens = _limit_truncate_pos_by_content_units(
@@ -310,19 +307,21 @@ class ServingRouterClassification(OpenAIServing):
                     image_content_token_id,
                     kept_images,
                 )
-                prompt_was_truncated = bool(
-                    safe_truncate_tokens is not None and safe_truncate_tokens >= 0 and len(raw_prompt_ids) > safe_truncate_tokens
-                )
+                
                 prompt_ids = _truncate_prompt_ids(
                     raw_prompt_ids,
                     max_prompt_tokens=safe_truncate_tokens,
                     cls_id=cls_id,
                     expects_cls="<|CLS|>" in raw_prompt,
                 )
+                
                 image_inputs, image_grid_thw = _trim_media_inputs_by_count(
                     image_inputs or [], image_grid_thw, kept_images
                 )
                 _validate_media_unit_alignment(image_inputs, image_grid_thw, kept_images, "image")
+                err = _validate_prompt_len(prompt_ids, validation_limit, "multimodal messages")
+                if err is not None:
+                    return self.create_error_response(err)
                 multi_modal_data: dict[str, Any] | None = None
                 if image_inputs or video_inputs:
                     multi_modal_data = {}
@@ -336,15 +335,19 @@ class ServingRouterClassification(OpenAIServing):
                 tokenization_kwargs = request.build_tok_params(model_config).get_encode_kwargs()
                 tokenized_prompts = await asyncio.gather(encode_async(raw_prompt, **tokenization_kwargs))
                 raw_prompt_ids = [int(x) for x in tokenized_prompts[0]]
-                prompt_was_truncated = bool(
-                    truncate_prompt_tokens is not None and truncate_prompt_tokens >= 0 and len(raw_prompt_ids) > truncate_prompt_tokens
-                )
+                if validation_limit is not None and validation_limit >= 0 and len(raw_prompt_ids) > validation_limit:
+                    return self.create_error_response(
+                        f"text messages too long before inference: tokens={len(raw_prompt_ids)}, limit={validation_limit}"
+                    )
                 prompt_ids = _truncate_prompt_ids(
                     raw_prompt_ids,
-                    max_prompt_tokens=truncate_prompt_tokens,
+                    max_prompt_tokens=effective_truncation_limit,
                     cls_id=cls_id,
                     expects_cls="<|CLS|>" in raw_prompt,
                 )
+                err = _validate_prompt_len(prompt_ids, validation_limit, "text messages")
+                if err is not None:
+                    return self.create_error_response(err)
                 engine_prompts = [tokens_input(prompt_ids, prompt=raw_prompt)]
         else:
             if not request.prompts:
@@ -354,15 +357,15 @@ class ServingRouterClassification(OpenAIServing):
             tokenized_prompts = await asyncio.gather(*(encode_async(p, **tokenization_kwargs) for p in request.prompts))
             for prompt, token_ids in zip(request.prompts, tokenized_prompts):
                 raw_prompt_ids = [int(x) for x in token_ids]
-                prompt_was_truncated = bool(
-                    truncate_prompt_tokens is not None and truncate_prompt_tokens >= 0 and len(raw_prompt_ids) > truncate_prompt_tokens
-                )
                 prompt_ids = _truncate_prompt_ids(
                     raw_prompt_ids,
-                    max_prompt_tokens=truncate_prompt_tokens,
+                    max_prompt_tokens=effective_truncation_limit,
                     cls_id=cls_id,
                     expects_cls="<|CLS|>" in prompt,
                 )
+                err = _validate_prompt_len(prompt_ids, validation_limit, "prompts")
+                if err is not None:
+                    return self.create_error_response(err)
                 engine_prompts.append(tokens_input(prompt_ids, prompt=prompt))
 
         trace_headers: Mapping[str, str] | None = None
